@@ -17,12 +17,14 @@ from dataset.utils import (
     get_modality_length_grouped_indices,
     get_length_grouped_indices,
     preprocess,
+    select_best_resolution,
     IGNORE_INDEX,
 )
 from torch.utils.data import DataLoader, Sampler
 from typing import Dict, List, Tuple, Optional, Sequence
 from dataclasses import dataclass
 from glob import glob
+import albumentations as A
 from PIL import Image
 import transformers
 import numpy as np
@@ -258,14 +260,19 @@ class InstructionGroundingDataset(LazySupervisedDataset):
 
     def _process_answer_grounding(self, data: Dict, image_size: Tuple[int, int]) -> torch.Tensor:
         height, width = image_size
-        patch_size = self.patch_size
-        
-        # 计算 patch 数量
-        patch_area_h = height // patch_size
-        patch_area_w = width // patch_size
-       # print(data)
-        total_patches = patch_area_h * patch_area_w
-        position_distribution = np.zeros(total_patches)
+        large_patch_size = 384
+        small_patch_size = self.patch_size
+
+        # 计算 384x384 patch 的数量
+        large_patch_area_h = height // large_patch_size
+        large_patch_area_w = width // large_patch_size
+        total_large_patches = large_patch_area_h * large_patch_area_w
+
+        # 计算每个 384x384 patch 内 14x14 小 patch 的数量
+        small_patches_per_large_patch = (large_patch_size // small_patch_size) * (large_patch_size // small_patch_size)
+        total_small_patches = total_large_patches * small_patches_per_large_patch
+
+        position_distribution = np.zeros(total_small_patches)
         total_pixels = height * width
 
         # 构建答案区域的掩码
@@ -276,53 +283,97 @@ class InstructionGroundingDataset(LazySupervisedDataset):
         points = points.reshape((-1, 1, 2))
         cv2.fillPoly(answer_mask, [points], 1)
 
-        # 遍历每个 patch
-        patch_index = 0
-        for i in range(patch_area_h):
-            for j in range(patch_area_w):
-                patch_y1 = i * patch_size
-                patch_y2 = patch_y1 + patch_size
-                patch_x1 = j * patch_size
-                patch_x2 = patch_x1 + patch_size
-                patch = answer_mask[patch_y1:patch_y2, patch_x1:patch_x2]
-                patch_pixels = patch_size * patch_size
-                pixels_in_answer = np.sum(patch)
-                if pixels_in_answer == 0:
-                    position_distribution[patch_index] = 0
-                elif pixels_in_answer == patch_pixels:
-                    position_distribution[patch_index] = patch_pixels / total_pixels
-                    
-                else:
-                    position_distribution[patch_index] = pixels_in_answer / total_pixels
-                    #print(pixels_in_answer / total_pixels)
-                patch_index += 1
+        small_patch_index = 0
+        # 遍历每个 384x384 的大 patch
+        for large_i in range(large_patch_area_h):
+            for large_j in range(large_patch_area_w):
+                large_patch_y1 = large_i * large_patch_size
+                large_patch_y2 = large_patch_y1 + large_patch_size
+                large_patch_x1 = large_j * large_patch_size
+                large_patch_x2 = large_patch_x1 + large_patch_size
+                large_patch = answer_mask[large_patch_y1:large_patch_y2, large_patch_x1:large_patch_x2]
+
+                # 遍历每个 384x384 大 patch 内的 14x14 小 patch
+                for small_i in range(large_patch_size // small_patch_size):
+                    for small_j in range(large_patch_size // small_patch_size):
+                        small_patch_y1 = small_i * small_patch_size
+                        small_patch_y2 = small_patch_y1 + small_patch_size
+                        small_patch_x1 = small_j * small_patch_size
+                        small_patch_x2 = small_patch_x1 + small_patch_size
+                        small_patch = large_patch[small_patch_y1:small_patch_y2, small_patch_x1:small_patch_x2]
+                        small_patch_pixels = small_patch_size * small_patch_size
+                        pixels_in_answer = np.sum(small_patch)
+
+                        if pixels_in_answer == 0:
+                            position_distribution[small_patch_index] = 0
+                        elif pixels_in_answer == small_patch_pixels:
+                            position_distribution[small_patch_index] = small_patch_pixels / total_pixels
+                        else:
+                            position_distribution[small_patch_index] = pixels_in_answer / total_pixels
+
+                        small_patch_index += 1
 
         # 归一化，确保所有概率和为 1
         total_sum = np.sum(position_distribution)
         if total_sum != 0:
             position_distribution /= total_sum
-            return torch.from_numpy(position_distribution).float()
         else:
-            raise ValueError("Total sum is zero, indicating no valid regions for distribution.") 
+            # 如果总和为 0，说明没有有效区域，将所有概率设为均匀分布
+            position_distribution = np.ones(total_small_patches) / total_small_patches
+
+        return torch.from_numpy(position_distribution).float()
 
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
-        try:
-            data_dict = super().__getitem__(i)
-            source = self.list_data_dict[i]
-            image_size = data_dict['image_size'][0]  # Assuming single image for now
-            position_distribution = self._process_answer_grounding(source, image_size)
-            data_dict['position_distribution'] = position_distribution
-            return data_dict
-        except ValueError as e:
-            return self.__getitem__(i+1)
+        data_dict = super().__getitem__(i)
 
-    @property
-    def lengths(self):
-        return super().lengths
+        source = self.list_data_dict[i]
+        if 'answer_grounding' in source:
+            image_file = source['image'][0]
+            success, image, img_size = self._process_single_image(image_file)
+            
+            if not success:
+                return self.__getitem__(i + 1)
+            try:
+                image1 = Image.open(image_file).convert('RGB')
+                image1 = np.array(image1)
+            except:
+                print(f"error opening the file: {image_file}")
+                return self.__getitem__(i + 1)
+            grounding_coords = [(coord["x"], coord["y"]) for coord in source["answer_grounding"]]
+            
+            if isinstance(self.anyres_grids, list):
+                possible_resolutions = self.anyres_grids
+            else:
+                possible_resolutions = eval(self.anyres_grids)
+            best_resolution = select_best_resolution(img_size, possible_resolutions)
+                   
+            # 使用 albumentations 进行图像和关键点的变换
+            transform = A.Compose([
+                A.Resize(height=best_resolution[1], width=best_resolution[0], interpolation=Image.BICUBIC),
+            ], keypoint_params=A.KeypointParams(format='xy'))
+            corrected_grounding_coords = []
+            for x, y in grounding_coords:
+                x = max(0, x)
+                y = max(0, y)
+                corrected_grounding_coords.append((x, y))
+            transformed = transform(image=image1, keypoints=corrected_grounding_coords)
+            processed_image = transformed['image']
+            new_grounding_coords = transformed['keypoints']
 
-    @property
-    def modality_lengths(self):
-        return super().modality_lengths
+            new_answer_grounding = [{"x": x, "y": y} for x, y in new_grounding_coords]
+            source['answer_grounding'] = new_answer_grounding
+            source['image'] = processed_image
+            new_img_size = (processed_image.shape[0], processed_image.shape[1])
+            position_distribution = self._process_answer_grounding(source, new_img_size)
+        else:
+            # If answer_grounding is not present, create a uniform distribution
+            position_distribution = torch.ones(self.patch_area * self.patch_area) / (self.patch_area * self.patch_area)
+
+        data_dict['position_distribution'] = position_distribution
+        data_dict['image'] = source['image']  
+
+        return data_dict
+
 
 class DataCollatorForGroundingDataset(DataCollatorForSupervisedDataset):
     def __init__(self, tokenizer, image_aspect_ratio):
@@ -454,6 +505,7 @@ if __name__ == "__main__":
         position_distributions = batch['position_distributions']
         vision_x = batch['vision_x']
         print("position_distributions shape:", position_distributions.shape)
+        print("vision_x shape:", vision_x[0][0].shape)
         print("vision_x shape:", vision_x[1][0].shape)
         print("vision_x shape:", vision_x[2][0].shape)
         print("vision_x shape:", vision_x[3][0].shape)

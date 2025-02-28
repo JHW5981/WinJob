@@ -334,8 +334,7 @@ class InstructionGroundingDataset(LazySupervisedDataset):
             if not success:
                 return self.__getitem__(i + 1)
             try:
-                image1 = Image.open(image_file).convert('RGB')
-                image1 = np.array(image1)
+                image1 = cv2.imread(image_file)
             except:
                 print(f"error opening the file: {image_file}")
                 return self.__getitem__(i + 1)

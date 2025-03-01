@@ -1,7 +1,7 @@
 # -*- encoding: utf-8 -*-
 '''
 @File    :   instruction_grounding_dataset.py
-@Time    :   2025/02/22 16:42:00
+@Time    :   2025/3/1 16:42:00
 @Author  :   zjr2022
 '''
 
@@ -345,7 +345,7 @@ class InstructionGroundingDataset(LazySupervisedDataset):
             else:
                 possible_resolutions = eval(self.anyres_grids)
             best_resolution = select_best_resolution(img_size, possible_resolutions)
-                   
+            
             # 使用 albumentations 进行图像和关键点的变换
             transform = A.Compose([
                 A.Resize(height=best_resolution[1], width=best_resolution[0], interpolation=Image.BICUBIC),
@@ -382,29 +382,18 @@ class DataCollatorForGroundingDataset(DataCollatorForSupervisedDataset):
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
         batch = super().__call__(instances)
         
-        position_distributions = []
-        for instance in instances:
+        position_distributions_dict = {}
+        for i, instance in enumerate(instances):
             if 'position_distribution' in instance:
-                position_distributions.append(instance['position_distribution'])
+                position_distributions_dict[i] = instance['position_distribution']
             else:
                 # If position_distribution is missing, create a uniform distribution
-                position_distributions.append(torch.ones(self.patch_area) / self.patch_area)
+                position_distributions_dict[i] = torch.ones(self.patch_area) / self.patch_area
 
-        # 找到最大长度
-        max_length = max([len(t) for t in position_distributions])
-        padded_tensors = []
-        for tensor in position_distributions:
-            if len(tensor) < max_length:
-                # 填充操作
-                padding = torch.zeros(max_length - len(tensor))
-                padded_tensor = torch.cat([tensor, padding])
-                padded_tensors.append(padded_tensor)
-            else:
-                padded_tensors.append(tensor)
-
-        batch['position_distributions'] = torch.stack(padded_tensors)
+        batch['position_distributions'] = position_distributions_dict
 
         return batch
+    
 
 class LengthGroupedSampler(Sampler):
     def __init__(
@@ -502,15 +491,15 @@ if __name__ == "__main__":
     for batch in instruction_grounding_dataset.dataloader:
         print(batch.keys())
         position_distributions = batch['position_distributions']
+        if isinstance(position_distributions, dict):
+           for index, tensor in position_distributions.items():
+               print(f"position_distributions shape of index {index}: {tensor.shape}")
+        else:
+            print(f"position_distributions shape: {position_distributions.shape}")
         vision_x = batch['vision_x']
-        print("position_distributions shape:", position_distributions.shape)
         print("vision_x shape:", vision_x[0][0].shape)
         print("vision_x shape:", vision_x[1][0].shape)
         print("vision_x shape:", vision_x[2][0].shape)
         print("vision_x shape:", vision_x[3][0].shape)
         print("vision_x shape:", vision_x[4][0].shape)
-        # if 'position_distributions' in batch:
-        #     print("position_distributions shape:", batch['position_distributions'].shape)
-        # if 'image_patch_num' in batch:
-        #     print("image_patch_num:", batch['image_patch_num'])
         break

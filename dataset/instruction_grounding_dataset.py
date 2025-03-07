@@ -1,5 +1,4 @@
 from configuration_grounding import DatasetConfig
-from transformers import DataCollatorForSeq2Seq
 from transformers.utils import PaddingStrategy
 from qwen_vl_utils import process_vision_info
 from torch.utils.data import DataLoader

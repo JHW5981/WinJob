@@ -1,53 +1,27 @@
-# -*- encoding: utf-8 -*-
-'''
-@File    :   instruction_grounding_dataset.py
-@Time    :   2025/3/1 16:42:00
-@Author  :   zjr2022
-'''
-
-import sys
-sys.path.append('/home/jihuawei2/projects/WinJob')
-sys.path.append('/home/jihuawei2/projects/WinJob/dataset')
-
-from dataset.configuration_grounding import DatasetConfig
+from configuration_grounding import DatasetConfig
+from transformers import DataCollatorForSeq2Seq
+from transformers.utils import PaddingStrategy
+from qwen_vl_utils import process_vision_info
+from torch.utils.data import DataLoader
 from torch.utils.data import Dataset
-from dataset.data_utils import DataInfo
-from dataset.utils import (
-    process_anyres_image_dataset,
-    get_modality_length_grouped_indices,
-    get_length_grouped_indices,
-    preprocess,
-    select_best_resolution,
-    IGNORE_INDEX,
-)
-from torch.utils.data import DataLoader, Sampler
-from typing import Dict, List, Tuple, Optional, Sequence
+from typing import Dict, Optional
 from dataclasses import dataclass
-from glob import glob
-import albumentations as A
+from PIL import ImageDraw
+from typing import Dict
 from PIL import Image
-import transformers
 import numpy as np
 import random
-import copy
 import json
 import torch
-import cv2
-import os
 
-DEFAULT_IMAGE_TOKEN = "<image>"
-
-# The following code is reused from https://github.com/salesforce/LAVIS/blob/xgen-mm/open_flamingo/train/sft_data_utils.py
-class LazySupervisedDataset(Dataset):
+class AceRead2Dataset(Dataset):
     """Dataset for supervised fine-tuning."""
 
     def __init__(self, 
                  dataset_config: DatasetConfig,
-                 tokenizer1: transformers.PreTrainedTokenizer, # Phi-3 tokenizer
-                 tokenizer2: transformers.PreTrainedTokenizer, # Siglip tokenizer
-                 image_processor,
+                 processor,
                  ):
-        super(LazySupervisedDataset, self).__init__()
+        super(AceRead2Dataset, self).__init__()
         self.dataset_config = dataset_config
         if isinstance(self.dataset_config.data_path, Dict):
             list_data_dict = []
@@ -60,446 +34,372 @@ class LazySupervisedDataset(Dataset):
         else:
             raise ValueError(f"Only Dict is acceptable, you give unknown data_path type: {type(self.dataset_config.data_path)}")
 
-        # rank0_print("Formatting inputs...Skip in lazy mode")
-        self.tokenizer1 = tokenizer1 # Phi-3 tokenizer
-        self.tokenizer2 = tokenizer2 # Siglip tokenizer
-        self.image_processor = image_processor
-        self.conv_template_name = self.dataset_config.conv_template_name
+        self.processor = processor
         self.list_data_dict = list_data_dict
         random.shuffle(self.list_data_dict)
-
-        self.anyres_grids = image_processor.grids
 
     def __len__(self):
         return len(self.list_data_dict)
 
-    @property
-    def lengths(self):
-        length_list = []
-        for sample in self.list_data_dict:
-            img_tokens = 128 if 'image' in sample else 0
-            length_list.append(sum(len(conv['value'].split()) for conv in sample['conversations']) + img_tokens)
-        return length_list
+    def check_coordinate(self, c):
+        if c[0] < 0:
+            c[0] = 0
+        if c[1] < 0:
+            c[1] = 0
+        return c
 
-    @property
-    def modality_lengths(self):
-        length_list = []
-        for sample in self.list_data_dict:
-            cur_len = sum(len(str(conv['value']).split()) for conv in sample['conversations'])
-            cur_len = cur_len if 'image' in sample else -cur_len
-            length_list.append(cur_len)
-        return length_list
+    def process_coordinate(self, coordinate, origin_h, origin_w, resized_h, resized_w):
+        h_ratio = resized_h/origin_h
+        w_ratio = resized_w/origin_w
+        new_coordinate = []
+        for c in coordinate:
+            c = self.check_coordinate(c)
+            new_c = [c[0]*h_ratio if c[0]*h_ratio < resized_h else resized_h, c[1]*w_ratio if c[1]*w_ratio < resized_w else resized_w]
+            new_coordinate.append(new_c)
+        return new_coordinate
 
-    def _process_single_image(self, image_file) -> Dict[str, torch.Tensor]:
-        image_file_fullpath = image_file
-        success = True
-        try:
-            image = Image.open(image_file_fullpath).convert('RGB')
-        except:
-            print(f"error opening the file: {image_file_fullpath}")
-            success = False
-            return success, None, None
-        processor = self.image_processor
-        img_size = image.size
-        if self.dataset_config.image_aspect_ratio == "anyres":
-            # Return image shape: [N_patch, C, H, W]
-            image = process_anyres_image_dataset(image, processor, self.anyres_grids, processor.size)
-        else:
-            raise ValueError(f"image_aspect_ratio must be anyres, but got {self.dataset_config.image_aspect_ratio}")
+    def __getitem__(self, i):
+        source = self.list_data_dict[i]
+        image_file = source["image"][0]
+        conversation = source["conversations"]
+        answer_grounding = [[item['y'], item['x']] for item in source["answer_grounding"]]
+
+        messages = [{
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "image": image_file,
+                },
+                {
+                    "type": "text",
+                    "text": conversation[0]['value']
+                }
+            ],
+        }]
+        output_content = conversation[1]['value']
+        text = self.processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        image_inputs, video_inputs = process_vision_info(messages)
+        inputs = self.processor(
+            text=[text],
+            images=image_inputs,
+            videos=video_inputs,
+            padding=True,
+            return_tensors="pt",
+        )
+        inputs = {key: value.tolist() for key, value in inputs.items()}
+        instruction = inputs
         
-        return success, image, img_size
+        response = self.processor.tokenizer(f"{output_content}", add_special_tokens=False)
+        input_ids = (
+                    instruction["input_ids"][0] + response["input_ids"] + [self.processor.tokenizer.pad_token_id]
+            )
+        attention_mask = instruction["attention_mask"][0] + response["attention_mask"] + [1]
+        labels = (
+                    [-100] * len(instruction["input_ids"][0])
+                    + response["input_ids"]
+                    + [self.processor.tokenizer.pad_token_id]
+            )
+
+        # process image
+        img = Image.open(image_file)
+        channel = 3
+        origin_h = img.height
+        origin_w = img.width
+        image_grid_thw = inputs['image_grid_thw']
+        grid_h = image_grid_thw[0][1] 
+        grid_w = image_grid_thw[0][2]  
+        patch_size = self.processor.image_processor.patch_size
+        merge_size = self.processor.image_processor.merge_size
+        resized_h = grid_h*patch_size
+        resized_w = grid_w*patch_size
+        temporal_patch_size = self.processor.image_processor.temporal_patch_size
+        pixel_values = np.array(inputs['pixel_values'])
+
+        # get original image
+        tokens_grid = pixel_values.reshape(1, grid_h//merge_size,\
+                                            grid_w//merge_size, \
+                                            merge_size, merge_size,\
+                                            channel, temporal_patch_size,\
+                                            patch_size, patch_size)
+
+        tokens_grid = tokens_grid.transpose(0, 6, 5, 1, 3, 7, 2, 4, 8)
+        tokens_grid = tokens_grid.reshape(temporal_patch_size, channel,\
+                                        grid_h*patch_size,\
+                                        grid_w*patch_size)
+        tokens_grid = tokens_grid[0]
+        tokens_grid = tokens_grid.transpose(1, 2, 0) # (xxx, xxx, 3)
+        original_pixel = (tokens_grid - tokens_grid.min()) / (tokens_grid.max() - tokens_grid.min())
+        
+        # process coordinate
+        answer_grounding = self.process_coordinate(answer_grounding, origin_h, origin_w, resized_h, resized_w)
+        
+        # get possibilites
+        mask_img = Image.new('L', (resized_w, resized_h), 0)
+        draw = ImageDraw.Draw(mask_img)
+        polygon_points = [(x, y) for (y, x) in answer_grounding]
+        draw.polygon(polygon_points, outline=1, fill=1)
+        mask_np = np.array(mask_img, dtype=np.uint8)
+        mask_np = np.expand_dims(mask_np, axis=0)
+        mask_np = np.expand_dims(mask_np, axis=0)
+        mask_np = np.repeat(mask_np, channel, axis=1)
+
+        # copy from Qwen2VLImageProcessor._preprocess
+        if mask_np.shape[0] % temporal_patch_size != 0:
+            repeats = np.repeat(mask_np[-1][np.newaxis], temporal_patch_size - 1, axis=0)
+            mask_np = np.concatenate([mask_np, repeats], axis=0)
+        grid_t = mask_np.shape[0] // temporal_patch_size
+        patches = mask_np.reshape(
+                    grid_t,
+                    temporal_patch_size,
+                    channel,
+                    grid_h // merge_size,
+                    merge_size,
+                    patch_size,
+                    grid_w // merge_size,
+                    merge_size,
+                    patch_size,
+                )
+        patches = patches.transpose(0, 3, 6, 4, 7, 2, 1, 5, 8)
+        flatten_patches = patches.reshape(
+                    grid_t * grid_h * grid_w, channel * temporal_patch_size * patch_size * patch_size
+                )
+        possibilites = flatten_patches.sum(axis=1) / flatten_patches.sum()
+        possibilites_recover = possibilites.reshape(1, grid_h//merge_size,\
+                                            grid_w//merge_size, \
+                                            merge_size, merge_size, 1, 1, 1, 1)
+        possibilites_recover = possibilites_recover.transpose(0, 6, 5, 1, 3, 7, 2, 4, 8)
+        possibilites_recover = possibilites_recover.reshape(1, 1,\
+                                        grid_h*1,\
+                                        grid_w*1).squeeze()
+
+        data_dict = {
+            "image": original_pixel,
+            "conversation": text + f" {output_content}" + "<|endoftext|>",
+            "input_ids": torch.tensor(input_ids),
+            "attention_mask": torch.tensor(attention_mask),
+            "labels": torch.tensor(labels),
+            "pixel_values": torch.tensor(pixel_values),
+            "answer_grounding": answer_grounding,
+            "possibilites": torch.tensor(possibilites),
+            "possibilites_recover": possibilites_recover,
+        }
     
-    def _check_img_token_nums(self, source):
-        keep_sample = True
-        if 'image' not in source:
-            # Make sure no <image> token in text-only samples.
-            for conv in source["conversations"]:
-                n_img_token = conv["value"].count(DEFAULT_IMAGE_TOKEN)
-                if n_img_token > 0:
-                    keep_sample = False
-                    break
-            return keep_sample, source
-        n_image = len(source['image']) if isinstance(source['image'], list) else 1
-        if n_image > 1:
-            # FIXME: the checker below doesn't work for mantis. Currently only check for single image data.
-            return keep_sample, source
-        for conv in source["conversations"]:
-            if conv["from"] == "human":
-                n_img_token = conv["value"].count(DEFAULT_IMAGE_TOKEN)
-                if not n_img_token == n_image:
-                    # print(source)
-                    conv["value"] = conv["value"].replace(DEFAULT_IMAGE_TOKEN, '').strip()
-                    conv["value"] = f"{DEFAULT_IMAGE_TOKEN}\n" * n_image + conv["value"]
-                break
-        return keep_sample, source
-
-    def __getitem__(self, i) -> Dict[str, torch.Tensor]:
-        sources = self.list_data_dict[i]
-        keep_sample, sources = self._check_img_token_nums(sources)
-        if not keep_sample:
-            return self.__getitem__(i+1)
-        if isinstance(i, int):
-            sources = [sources]
-        assert len(sources) == 1, "Don't know why it is wrapped to a list"  # FIXME
-        # Add the system prompt.
-        system_round = {
-              "from": "system",
-              "value": "A chat between a curious user and an artificial intelligence assistant. The assistant gives concise answers to the user's questions."
-            }
-        if sources[0]["conversations"][0]["from"] != "system":
-            sources[0]["conversations"] = [system_round] + sources[0]["conversations"]
-
-        if 'image' in sources[0]:
-            has_image = True
-            image_file = sources[0]['image']
-            assert isinstance(image_file, list)
-            # FIXME: Skipping samples with more than 4 images to avoid OOM issue.
-            if len(image_file) > 4:
-                return self.__getitem__(i+1)
-            image = []
-            img_size = []
-            img_patch_num = [] # added by JHW5981 FIXME: multi images will cause error, fix in the future
-            for single_image in image_file:
-                success, image_i, img_size_i = self._process_single_image(single_image)
-                if not success:
-                    # Skip the entire sample if one of the images can't be opened.
-                    return self.__getitem__(i+1)
-                image.append(image_i)
-                img_size.append(img_size_i)
-                img_patch_num.append(image_i.shape[0])
-            sources = copy.deepcopy([e["conversations"] for e in sources])
-        else:
-            has_image = False
-            sources = copy.deepcopy([e["conversations"] for e in sources])
-        data_dict = preprocess(
-            sources,
-            self.tokenizer1,
-            conv_template_name=self.conv_template_name)
-        if isinstance(i, int):
-            data_dict = dict(input_ids=data_dict["input_ids"][0],
-                             labels=data_dict["labels"][0])
-            
-        # add semantic tokens by JHW5981
-        query = sources[0][1]['content'].replace(f"<image>\n", "") # FIXME: not using fixed <image> but attribute from tokenizer1, considering more than one query sentence
-        semantic_inputs = self.tokenizer2(query, padding="max_length", return_tensors="pt")
-        data_dict['lang_y'] = semantic_inputs
-
-        # image exist in the data
-        if has_image:
-            assert isinstance(image, list)
-            # Multi-image, each image can be of 4-dim (anyres) or 3-dim (base res)
-            data_dict['vision_x'] = image 
-            data_dict['image_size'] = img_size
-            data_dict['image_patch_num'] = img_patch_num
-        else:
-            # image does not exist in the data, but the model is multimodal
-            crop_size = self.image_processor.transforms[0].size # FIXME: Hardcoded workaround to work with torchvision.Compose()
-            data_dict['vision_x'] = torch.zeros(1, 1, 3, crop_size[0], crop_size[1]) # Expand dims with [T_img, F] to be compatible with flamingo-like vision encoding.
-            data_dict['image_size'] = crop_size
-            data_dict['image_patch_num'] = img_patch_num
         return data_dict
+
+# copied from transformers/data/data_collator.py
+def pad_without_fast_tokenizer_warning(tokenizer, *pad_args, **pad_kwargs):
+    """
+    Pads without triggering the warning about how using the pad function is sub-optimal when using a fast tokenizer.
+    """
+
+    # To avoid errors when using Feature extractors
+    if not hasattr(tokenizer, "deprecation_warnings"):
+        return tokenizer.pad(*pad_args, **pad_kwargs)
+
+    # Save the state of the warning, then disable it
+    warning_state = tokenizer.deprecation_warnings.get("Asking-to-pad-a-fast-tokenizer", False)
+    tokenizer.deprecation_warnings["Asking-to-pad-a-fast-tokenizer"] = True
+
+    try:
+        padded = tokenizer.pad(*pad_args, **pad_kwargs)
+    finally:
+        # Restore the state of the warning.
+        tokenizer.deprecation_warnings["Asking-to-pad-a-fast-tokenizer"] = warning_state
+
+    return padded
 
 @dataclass
-class DataCollatorForSupervisedDataset(object):
-    """Collate examples for supervised fine-tuning."""
+class DataCollatorForAceRead2Dataset:
 
-    tokenizer: transformers.PreTrainedTokenizer
-    image_aspect_ratio: str
+    processor: object = None
+    padding: bool = True
+    max_length: Optional[int] = None
+    pad_to_multiple_of: Optional[int] = None
+    label_pad_token_id: int = -100
+    return_tensors: str = "pt"
 
-    def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
-        input_ids, labels = tuple([instance[key] for instance in instances]
-                                  for key in ("input_ids", "labels"))
-        input_ids = torch.nn.utils.rnn.pad_sequence(
-            input_ids,
-            batch_first=True,
-            padding_value=self.tokenizer.pad_token_id)
-        labels = torch.nn.utils.rnn.pad_sequence(labels,
-                                                 batch_first=True,
-                                                 padding_value=IGNORE_INDEX)
-        input_ids = input_ids[:, :self.tokenizer.model_max_length]
-        labels = labels[:, :self.tokenizer.model_max_length]
+    def __call__(self, features):
+        label_name = "labels"
+        labels = [feature[label_name] for feature in features] if label_name in features[0].keys() else None
 
-        # added by JHW5981
-        lang_y = torch.cat([i['lang_y']['input_ids'] for i in instances], dim=0)
+        input_ids_and_attention_mask = [{k: v for k, v in feature.items() if k in ["input_ids", "attention_mask"]} for feature in features]
+        images = [feature["image"] for feature in features]
+        conversation = [feature["conversation"] for feature in features]
+        pixel_values = [feature["pixel_values"] for feature in features]
+        answer_grounding = [feature["answer_grounding"] for feature in features]
+        possibilites = [feature["possibilites"] for feature in features]
+        possibilites_recover = [feature["possibilites_recover"] for feature in features]
 
-        batch = dict(
-            lang_x=input_ids,
-            labels=labels,
-            attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
-            lang_y={'input_ids': lang_y},
+        # run through tokenizer without labels to ensure no side effects
+        batch = pad_without_fast_tokenizer_warning(
+            self.processor.tokenizer,
+            input_ids_and_attention_mask,
+            padding=self.padding,
+            max_length=self.max_length,
+            pad_to_multiple_of=self.pad_to_multiple_of,
+            return_tensors=self.return_tensors,
         )
-
-        if 'vision_x' in instances[0]:
-            images = [instance['vision_x'] for instance in instances]
-            image_size = [instance['image_size'] for instance in instances]
-            image_patch_num = [instance['image_patch_num'] for instance in instances]
-            batch['image_size'] = image_size
-            batch['image_patch_num'] = image_patch_num
-            batch['vision_x'] = images
-            batch['image_size'] = image_size
-
-        return batch
-
-class InstructionGroundingDataset(LazySupervisedDataset):
-    def __init__(
-        self,
-        dataset_config: DatasetConfig,
-        tokenizer1: transformers.PreTrainedTokenizer,
-        tokenizer2: transformers.PreTrainedTokenizer,
-        image_processor,
-    ):
-        super().__init__(dataset_config, tokenizer1, tokenizer2, image_processor)
-        # patch_area 是网格的面积，如 196
-        self.patch_area = dataset_config.patch_area
-        # patch_size 是网格边长，如 14
-        self.patch_size = int(self.patch_area**0.5)
-
-    def _process_single_image(self, image_file) -> Dict[str, torch.Tensor]:
-        success, image, img_size = super()._process_single_image(image_file)
-        return success, image, img_size
-
-    def _process_answer_grounding(self, data: Dict, image_size: Tuple[int, int]) -> torch.Tensor:
-        height, width = image_size
-        large_patch_size = 384
-        small_patch_size = self.patch_size
-
-        # 计算 384x384 patch 的数量
-        large_patch_area_h = height // large_patch_size
-        large_patch_area_w = width // large_patch_size
-        total_large_patches = large_patch_area_h * large_patch_area_w
-
-        # 计算每个 384x384 patch 内 14x14 小 patch 的数量
-        small_patches_per_large_patch = (large_patch_size // small_patch_size) * (large_patch_size // small_patch_size)
-        total_small_patches = total_large_patches * small_patches_per_large_patch
-
-        position_distribution = np.zeros(total_small_patches)
-        total_pixels = height * width
-
-        # 构建答案区域的掩码
-        answer_mask = np.zeros((height, width), dtype=np.uint8)
-        grounding_coords = data["answer_grounding"]
-        points = [(int(coord["x"]), int(coord["y"])) for coord in grounding_coords]
-        points = np.array(points, np.int32)
-        points = points.reshape((-1, 1, 2))
-        cv2.fillPoly(answer_mask, [points], 1)
-
-        small_patch_index = 0
-        # 遍历每个 384x384 的大 patch
-        for large_i in range(large_patch_area_h):
-            for large_j in range(large_patch_area_w):
-                large_patch_y1 = large_i * large_patch_size
-                large_patch_y2 = large_patch_y1 + large_patch_size
-                large_patch_x1 = large_j * large_patch_size
-                large_patch_x2 = large_patch_x1 + large_patch_size
-                large_patch = answer_mask[large_patch_y1:large_patch_y2, large_patch_x1:large_patch_x2]
-
-                # 遍历每个 384x384 大 patch 内的 14x14 小 patch
-                for small_i in range(large_patch_size // small_patch_size):
-                    for small_j in range(large_patch_size // small_patch_size):
-                        small_patch_y1 = small_i * small_patch_size
-                        small_patch_y2 = small_patch_y1 + small_patch_size
-                        small_patch_x1 = small_j * small_patch_size
-                        small_patch_x2 = small_patch_x1 + small_patch_size
-                        small_patch = large_patch[small_patch_y1:small_patch_y2, small_patch_x1:small_patch_x2]
-                        small_patch_pixels = small_patch_size * small_patch_size
-                        pixels_in_answer = np.sum(small_patch)
-
-                        if pixels_in_answer == 0:
-                            position_distribution[small_patch_index] = 0
-                        elif pixels_in_answer == small_patch_pixels:
-                            position_distribution[small_patch_index] = small_patch_pixels / total_pixels
-                        else:
-                            position_distribution[small_patch_index] = pixels_in_answer / total_pixels
-
-                        small_patch_index += 1
-
-        # 归一化，确保所有概率和为 1
-        total_sum = np.sum(position_distribution)
-        if total_sum != 0:
-            position_distribution /= total_sum
-        else:
-            # 如果总和为 0，说明没有有效区域，将所有概率设为均匀分布
-            position_distribution = np.ones(total_small_patches) / total_small_patches
-
-        return torch.from_numpy(position_distribution).float()
-
-    def __getitem__(self, i) -> Dict[str, torch.Tensor]:
-        data_dict = super().__getitem__(i)
-
-        source = self.list_data_dict[i]
-        if 'answer_grounding' in source:
-            image_file = source['image'][0]
-            success, image, img_size = self._process_single_image(image_file)
-            
-            if not success:
-                return self.__getitem__(i + 1)
-            try:
-                image1 = cv2.imread(image_file)
-            except:
-                print(f"error opening the file: {image_file}")
-                return self.__getitem__(i + 1)
-            grounding_coords = [(coord["x"], coord["y"]) for coord in source["answer_grounding"]]
-            
-            if isinstance(self.anyres_grids, list):
-                possible_resolutions = self.anyres_grids
-            else:
-                possible_resolutions = eval(self.anyres_grids)
-            best_resolution = select_best_resolution(img_size, possible_resolutions)
-            
-            # 使用 albumentations 进行图像和关键点的变换
-            transform = A.Compose([
-                A.Resize(height=best_resolution[1], width=best_resolution[0], interpolation=Image.BICUBIC),
-            ], keypoint_params=A.KeypointParams(format='xy'))
-            corrected_grounding_coords = []
-            for x, y in grounding_coords:
-                x = max(0, x)
-                y = max(0, y)
-                corrected_grounding_coords.append((x, y))
-            transformed = transform(image=image1, keypoints=corrected_grounding_coords)
-            processed_image = transformed['image']
-            new_grounding_coords = transformed['keypoints']
-
-            new_answer_grounding = [{"x": x, "y": y} for x, y in new_grounding_coords]
-            source['answer_grounding'] = new_answer_grounding
-            source['image'] = processed_image
-            new_img_size = (processed_image.shape[0], processed_image.shape[1])
-            position_distribution = self._process_answer_grounding(source, new_img_size)
-        else:
-            # If answer_grounding is not present, create a uniform distribution
-            position_distribution = torch.ones(self.patch_area * self.patch_area) / (self.patch_area * self.patch_area)
-
-        data_dict['position_distribution'] = position_distribution
-        data_dict['image'] = source['image']  
-
-        return data_dict
-
-
-class DataCollatorForGroundingDataset(DataCollatorForSupervisedDataset):
-    def __init__(self, tokenizer, image_aspect_ratio):
-        super().__init__(tokenizer, image_aspect_ratio)
-        self.patch_area = int(14**2)  # Assuming 14x14 grid, adjust if necessary
-
-    def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
-        batch = super().__call__(instances)
         
-        position_distributions_dict = {}
-        for i, instance in enumerate(instances):
-            if 'position_distribution' in instance:
-                position_distributions_dict[i] = instance['position_distribution']
+        # we have to pad the labels manually as we cannot rely on `tokenizer.pad` and we need them to be of the same length to return tensors
+        no_padding = self.padding is False or self.padding == PaddingStrategy.DO_NOT_PAD
+        if labels is not None:
+            if no_padding:
+                if isinstance(features[0][label_name], list):
+                    batch["labels"] = list(labels)
+                else:
+                    batch["labels"] = [np.concatenate([label, []]) for label in labels]
             else:
-                # If position_distribution is missing, create a uniform distribution
-                position_distributions_dict[i] = torch.ones(self.patch_area) / self.patch_area
+                max_padding = self.padding == PaddingStrategy.MAX_LENGTH and self.max_length is not None
+                max_label_length = max(len(l) for l in labels) if not max_padding else self.max_length
+                if self.pad_to_multiple_of is not None:
+                    max_label_length = (
+                        (max_label_length + self.pad_to_multiple_of - 1)
+                        // self.pad_to_multiple_of
+                        * self.pad_to_multiple_of
+                    )
 
-        batch['position_distributions'] = position_distributions_dict
+                padding_side = self.processor.tokenizer.padding_side
+                if isinstance(features[0][label_name], list):
+                    batch["labels"] = [
+                        label + [self.label_pad_token_id] * (max_label_length - len(label))
+                        if padding_side == "right"
+                        else [self.label_pad_token_id] * (max_label_length - len(label)) + label
+                        for label in labels
+                    ]
+                else:
+                    batch["labels"] = [
+                        np.concatenate(
+                            [
+                                label,
+                                np.array([self.label_pad_token_id] * (max_label_length - len(label)), dtype=np.int64),
+                            ]
+                        )
+                        if padding_side == "right"
+                        else np.concatenate(
+                            [
+                                np.array([self.label_pad_token_id] * (max_label_length - len(label)), dtype=np.int64),
+                                label,
+                            ]
+                        )
+                        for label in labels
+                    ]
 
-        return batch
-    
+        # reintroduce side effects via tokenizer that return respective datatypes for the `return_tensors` argument
+        if batch.get("labels", None) is not None:
+            if self.return_tensors == "pt":
+                import torch
 
-class LengthGroupedSampler(Sampler):
-    def __init__(
-        self,
-        batch_size: int,
-        world_size: int,
-        lengths: Optional[List[int]] = None,
-        generator=None,
-        group_by_modality: bool = False,
-    ):
-        if lengths is None:
-            raise ValueError("Lengths must be provided.")
+                batch["labels"] = torch.tensor(batch["labels"], dtype=torch.int64)
+            elif self.return_tensors == "tf":
+                import tensorflow as tf
 
-        self.batch_size = batch_size
-        self.world_size = world_size
-        self.lengths = lengths
-        self.generator = generator
-        self.group_by_modality = group_by_modality
-
-    def __len__(self):
-        return len(self.lengths)
-
-    def __iter__(self):
-        if self.group_by_modality:
-            indices = get_modality_length_grouped_indices(self.lengths, self.batch_size, self.world_size, generator=self.generator)
+                batch["labels"] = tf.constant(batch["labels"], dtype=tf.int64)
+            else:
+                batch["labels"] = np.array(batch["labels"], dtype=np.int64)
         else:
-            indices = get_length_grouped_indices(self.lengths, self.batch_size, self.world_size, generator=self.generator)
-        return iter(indices)
+            batch["labels"] = None
+        batch['image'] = images
+        batch['conversation'] = conversation
+        batch['pixel_values'] = pixel_values
+        batch['answer_grounding'] = answer_grounding
+        batch['possibilites'] = possibilites
+        batch['possibilites_recover'] = possibilites_recover
+        return batch
 
 def make_instruction_grounding_dataset(
-    dataset_config: DatasetConfig,
-    tokenizer1: transformers.PreTrainedTokenizer,
-    tokenizer2: transformers.PreTrainedTokenizer,
-    image_processor,
+    dataset_config,
+    processor,
 ):
-    train_dataset = InstructionGroundingDataset(
+    train_dataset = AceRead2Dataset(
         dataset_config=dataset_config,
-        tokenizer1=tokenizer1,
-        tokenizer2=tokenizer2,
-        image_processor=image_processor
+        processor=processor
     )
-    data_collator = DataCollatorForGroundingDataset(
-        tokenizer=tokenizer1,
-        image_aspect_ratio=dataset_config.image_aspect_ratio
+    data_collator = DataCollatorForAceRead2Dataset(
+        processor=processor,
+        padding=True
     )
-
-    # Use length grouped sampler for more balanced GPU usages.
-    lengths = train_dataset.modality_lengths
-    sampler = LengthGroupedSampler(
-        dataset_config.batch_size,
-        world_size=dataset_config.world_size * dataset_config.gradient_accumulation_steps,
-        lengths=lengths,
-        group_by_modality=True,
-        generator=torch.Generator().manual_seed(42),
-    )
-
     data_loader = DataLoader(
         train_dataset,
         batch_size=dataset_config.batch_size,
         num_workers=dataset_config.workers,
         pin_memory=True,
-        sampler=sampler,
-        shuffle=sampler is None,
         collate_fn=data_collator,
     )
 
-    return DataInfo(
-        name='instruction-grounding-mix',
-        dataloader=data_loader,
-        batch_size=dataset_config.batch_size,
-        loss_multiplier=1.0,
-        shared_epoch=None,
-        sampler=sampler,
-    ), len(train_dataset)
+    return data_loader, len(train_dataset)
 
 if __name__ == "__main__":
-    from dataset.configuration_grounding import DatasetConfig, ImageProcessorConfig
-    from dataset.image_processor import ImageProcessor
-    from transformers import AutoTokenizer
-
+    from transformers import Qwen2_5_VLProcessor
     dataset_config = DatasetConfig()
-    tokenizer1 = AutoTokenizer.from_pretrained("/home/jihuawei2/projects/AceRead/pretrain_weights/xgen-mm-phi3-mini-Instruct/xgen")
-    tokenizer2 = AutoTokenizer.from_pretrained("/home/jihuawei2/projects/AceRead/pretrain_weights/xgen-mm-phi3-mini-Instruct/siglip-so400m-patch14-384")
-    
-    image_processor_config = ImageProcessorConfig()
-    image_processor = ImageProcessor(image_processor_config)
-    instruction_grounding_dataset, num_samples = make_instruction_grounding_dataset(
-        dataset_config=dataset_config,
-        tokenizer1=tokenizer1,
-        tokenizer2=tokenizer2,
-        image_processor=image_processor,
-    )
-    print("num_samples:", num_samples)
-    print("anyres_grids:", instruction_grounding_dataset.dataloader.dataset.anyres_grids)
-    for batch in instruction_grounding_dataset.dataloader:
-        print(batch.keys())
-        position_distributions = batch['position_distributions']
-        if isinstance(position_distributions, dict):
-           for index, tensor in position_distributions.items():
-               print(f"position_distributions shape of index {index}: {tensor.shape}")
-        else:
-            print(f"position_distributions shape: {position_distributions.shape}")
-        vision_x = batch['vision_x']
-        print("vision_x shape:", vision_x[0][0].shape)
-        print("vision_x shape:", vision_x[1][0].shape)
-        print("vision_x shape:", vision_x[2][0].shape)
-        print("vision_x shape:", vision_x[3][0].shape)
-        print("vision_x shape:", vision_x[4][0].shape)
+    processor = Qwen2_5_VLProcessor.from_pretrained("/home/jihuawei2/projects/WinJob/pretrained_weight/Qwen2.5-VL-3B-Instruct")
+    dataloader, dataset_size = make_instruction_grounding_dataset(dataset_config, processor)
+    for data in dataloader:
+        print(data.keys())
+        # print(data['image'].shape)
+        # print(data['answer_grounding'])
+        # print(data['conversation'])
+        # print(data['possibilites_recover'])
+        print(data['input_ids'].shape)
+        print(data['attention_mask'].shape)
         break
+    
+    
+    
+    
+    
+    
+    
+    # dataset = AceRead2Dataset(dataset_config, processor)
+    # inputs = dataset[0]
+    # image = inputs['image']
+    # answer_grounding = inputs['answer_grounding']
+    # conversation = inputs['conversation']
+    # possibilites_recover = inputs['possibilites_recover']
+    # mask_uint8 = ((possibilites_recover>0) * 255).astype(np.uint8)
+    # img = Image.fromarray(mask_uint8, mode='L')
+    # img.save('mask_image.png')
+
+    # print(image.shape)
+    # print(answer_grounding)
+    # print(conversation)
+
+    # import matplotlib.pyplot as plt
+    # import numpy as np
+    # from matplotlib.patches import Polygon
+
+    # # 如果 image 是 torch.Tensor，则转换为 numpy 数组
+    # if isinstance(image, torch.Tensor):
+    #     image_np = image.cpu().numpy()
+    # else:
+    #     image_np = image
+
+    # # 确保图像数值在 [0, 1] 范围内
+    # image_np = np.clip(image_np, 0, 1)
+
+    # plt.figure(figsize=(8, 8))
+    # plt.imshow(image_np)
+
+    # ax = plt.gca()
+
+    # # 如果 answer_grounding 中的点数大于等于 3，则构成多边形
+    # if len(answer_grounding) >= 3:
+    #     # answer_grounding 点格式为 [y, x]，转换为 [x, y]
+    #     polygon_points = [[pt[1], pt[0]] for pt in answer_grounding]
+    #     # 创建一个多边形补丁，closed=True 表示闭合多边形，fill=False 表示不填充颜色
+    #     poly_patch = Polygon(polygon_points, closed=True, fill=False, edgecolor='red', linewidth=2)
+    #     ax.add_patch(poly_patch)
+    # else:
+    #     # 否则仅绘制散点
+    #     for pt in answer_grounding:
+    #         y, x = pt
+    #         plt.scatter(x, y, s=100, c='red', marker='o')
+
+    # plt.title("Image with Answer Grounding Polygon")
+    # plt.axis('off')
+
+    # # 保存图片到文件，保存前调用 plt.savefig，再调用 plt.show()
+    # plt.savefig('output_polygon.png', bbox_inches='tight')
+    # plt.show()

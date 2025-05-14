@@ -1,0 +1,92 @@
+{
+  "qwen2_5_3b_instruct": {
+    "aokvqa_test.json": {
+      "acc": 0.08848105043270665
+    },
+    "chartvqa_test.json": {
+      "acc": 0.6624
+    },
+    "docvqa_test.json": {
+      "acc": 0.7506075902037764
+    },
+    "infovqa_test.json": {
+      "acc": 0.5819350232059979
+    },
+    "tablevqa_test.json": {
+      "acc": 0.3933333333333333
+    },
+    "textvqa_test.json": {
+      "acc": 0.5206
+    }
+  },
+  "qwen2_5_7b_instruct": {
+    "aokvqa_test.json": {
+      "acc": 0.08325872873769025
+    },
+    "chartvqa_test.json": {
+      "acc": 0.6448
+    },
+    "docvqa_test.json": {
+      "acc": 0.7369601794727987
+    },
+    "infovqa_test.json": {
+      "acc": 0.6033559443056051
+    }
+  },
+  "internvl3_1b_instruct": {
+    "aokvqa_test.json": {
+      "acc": 0.057594747836466724
+    },
+    "chartvqa_test.json": {
+      "acc": 0.4796
+    },
+    "docvqa_test.json": {
+      "acc": 0.6343241727425687
+    },
+    "infovqa_test.json": {
+      "acc": 0.2938236344162799
+    },
+    "tablevqa_test.json": {
+      "acc": 0.22666666666666666
+    },
+    "textvqa_test.json": {
+      "acc": 0.243
+    }
+  },
+  "internvl3_2b_instruct": {
+    "aokvqa_test.json": {
+      "acc": 0.06863622799164429
+    },
+    "chartvqa_test.json": {
+      "acc": 0.4864
+    },
+    "docvqa_test.json": {
+      "acc": 0.6756403065993644
+    },
+    "infovqa_test.json": {
+      "acc": 0.36522670474830415
+    },
+    "tablevqa_test.json": {
+      "acc": 0.3466666666666667
+    },
+    "textvqa_test.json": {
+      "acc": 0.3094
+    }
+  },
+  "llava-1.5-7b": {},
+  "blip2_opt_2_7b": {},
+  "llama_llava_next_8b": {
+    "aokvqa_test.json": {
+      "acc": 0.06669650850492391
+    },
+    "chartvqa_test.json": {
+      "acc": 0.4292
+    }
+  },
+  "gemma3_4b_instruct": {},
+  "instructblip_vicuna_7b": {},
+  "kimi_vl_a3b_instruct": {},
+  "fuyu_8b": {},
+  "phi_3_5_vision_4_2b_instruct": {},
+  "__pycache__": {}
+}
